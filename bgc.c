@@ -4,15 +4,6 @@
 #include <pthread.h>
 #include <stdbool.h>
 
-typedef struct mutator_info_t {
-    bool stw_call;
-    pthread_mutex_t stw_call_m;
-} mutator_info;
-
-void mutator_thread(mutator_info *info);
-void safepoint(mutator_info *info);
-void stw();
-
 bool stw_end = false;
 pthread_mutex_t stw_end_m = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t stw_end_c = PTHREAD_COND_INITIALIZER;
@@ -21,21 +12,197 @@ int safepoint_ack_count = 0;
 pthread_mutex_t safepoint_m = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t safepoint_c = PTHREAD_COND_INITIALIZER;
 
+typedef struct object_t object;
+typedef struct list_node_t list_node;
+typedef struct list_t list;
+typedef struct mutator_info_t mutator_info;
+
+bool stw_call = false;
+pthread_mutex_t stw_call_m = PTHREAD_MUTEX_INITIALIZER;
+
+struct mutator_info_t {
+    list *roots;
+};
+
+void mutator_thread(mutator_info *info);
+void safepoint(mutator_info *info, bool invalidate);
+void stw();
+
 mutator_info mutators[5];
 
+struct object_t {
+    bool marked;
+    int id;
+    list *refs;
+};
+
+struct list_node_t {
+    void *element;
+    list_node *next;
+    list_node *previous;
+};
+
+struct list_t {
+    list_node *first;
+    list_node *last;
+    int size;
+};
+
+list *all_objects;
+pthread_mutex_t all_objects_m = PTHREAD_MUTEX_INITIALIZER;
+
+void add_first(list *list, void *element) {
+    list_node *node = malloc(sizeof(list_node));
+
+    node->element = element;
+    node->previous = NULL;
+    node->next = list->first;
+
+    if(list->size == 0) {
+        list->last = node;
+    } else {
+        list->first->previous = node;
+    }
+
+    list->first = node;
+    list->size++;
+}
+
+void add_last(list *list, void *element) {
+    list_node *node = malloc(sizeof(list_node));
+
+    node->element = element;
+    node->previous = list->last;
+    node->next = NULL;
+
+    if(list->size == 0) {
+        list->first = node;
+    } else {
+        list->last->next = node;
+    }
+
+    list->last = node;
+    list->size++;
+}
+
+void add_all(list *target, list *source) {
+    if(source->size == 0) {
+        return;
+    }
+
+    list_node *curr_node = source->first;
+
+    do {
+        add_last(target, curr_node->element);
+    } while((curr_node = curr_node->next) != NULL);
+}
+
+void remove_last(list *list) {
+    if(list->size == 0) {
+        return;
+    }
+
+    list->last = list->last->previous;
+    
+    if(list->last != NULL) {
+        list->last->next = NULL;
+    }
+
+    /*TODO: memory leak*/
+
+    list->size--;
+}
+
+bool is_empty(list *list) {
+    return list->size == 0;
+}
+
+list *new_list() {
+    list *new_list = malloc(sizeof(list));
+
+    new_list->first = NULL;
+    new_list->last = NULL;
+    new_list->size = 0;
+
+    return new_list;
+}
+
+object *new_object() {
+    static int id = 0;
+
+    object *new_object = malloc(sizeof(object));
+
+    new_object->marked = false;
+    new_object->id = id;
+    new_object->refs = new_list();
+
+    id++;
+
+
+
+    pthread_mutex_lock(&all_objects_m);
+    add_last(all_objects, new_object);
+    pthread_mutex_unlock(&all_objects_m);
+
+    return new_object;
+}
+
+list *worklist;
+pthread_mutex_t worklist_m = PTHREAD_MUTEX_INITIALIZER;
+
+void tc_mark_sweep(list *roots) {
+    worklist = new_list();
+
+    add_all(worklist, roots);
+
+    while(worklist->size != 0) {
+        pthread_mutex_lock(&worklist_m);
+
+        if(worklist->size == 0) {
+            pthread_mutex_unlock(&worklist_m);
+            break;
+        }
+
+        object *obj = (object *) worklist->last->element;
+        remove_last(worklist);
+
+        pthread_mutex_unlock(&worklist_m);
+
+        if(obj->marked == false) {
+            obj->marked = true;
+            add_all(worklist, obj->refs);
+        }
+    }
+
+    list_node *curr_node = all_objects->first;
+
+    do {
+        object *obj = (object *) curr_node->element;
+        
+        if(obj->marked == false) {
+            printf("delete object %d\n", obj->id);
+        }
+    } while((curr_node = curr_node->next) != NULL);
+}
+
 int main() {
+    all_objects = new_list();
+
     pthread_t threads[5];
     
     for(int i = 0; i < 5; i++) {
-        mutators[i].stw_call = false;
-        pthread_mutex_init(&mutators[i].stw_call_m, NULL);
-
+        mutators[i].roots = new_list();
+        
         pthread_create(&threads[i], NULL, &mutator_thread, &mutators[i]);
     }
 
     sleep(1);
 
     stw();
+
+    /*sleep(4);
+
+    stw();*/
 
     for(int i = 0; i < 5; i++) {
         pthread_join(threads[i], NULL);
@@ -47,18 +214,30 @@ int main() {
 void mutator_thread(mutator_info *info) {
     pthread_t self_thread = pthread_self();
 
+    object *a = new_object();
+    object *b = new_object();
+    object *c = new_object();
+    object *d = new_object();
+
+    add_first(a->refs, b);
+    add_first(a->refs, c);
+
+    add_first(info->roots, a);
+
     printf("enter mutator %ld\n", self_thread);
     printf("start mutator logic %ld\n", self_thread);
     sleep(10);
     printf("end mutator logic %ld\n", self_thread);
-    safepoint(info);
+    safepoint(info, true);
+    sleep(5);
+    safepoint(info, false);
     printf("exit mutator %ld\n", self_thread);
 }
 
-void safepoint(mutator_info *info) {
-    pthread_mutex_lock(&info->stw_call_m);
-    bool stw_call_copy = info->stw_call;
-    pthread_mutex_unlock(&info->stw_call_m);
+void safepoint(mutator_info *info, bool invalidate) {
+    pthread_mutex_lock(&stw_call_m);
+    bool stw_call_copy = stw_call;
+    pthread_mutex_unlock(&stw_call_m);
 
     pthread_mutex_lock(&safepoint_m);
     safepoint_ack_count++;
@@ -76,6 +255,12 @@ void safepoint(mutator_info *info) {
 
         printf("end wait stw end");
     }
+
+    if(invalidate) {
+        pthread_mutex_lock(&safepoint_m);
+        safepoint_ack_count--;
+        pthread_mutex_unlock(&safepoint_m);
+    }
 }
 
 void stw() {
@@ -87,11 +272,9 @@ void stw() {
 
     printf("begin stw call\n");
 
-    for(int i = 0; i < 5; i++) {
-        pthread_mutex_lock(&mutators[i].stw_call_m);
-        mutators[i].stw_call = true;
-        pthread_mutex_unlock(&mutators[i].stw_call_m);
-    }
+    pthread_mutex_lock(&stw_call_m);
+    stw_call = true;
+    pthread_mutex_unlock(&stw_call_m);
 
     printf("end stw call\n");
     printf("begin wait safepoint\n");
@@ -102,16 +285,20 @@ void stw() {
     }
     pthread_mutex_unlock(&safepoint_m);
 
-    for(int i = 0; i < 5; i++) {
-        pthread_mutex_lock(&mutators[i].stw_call_m);
-        mutators[i].stw_call = false;
-        pthread_mutex_unlock(&mutators[i].stw_call_m);
-    }
+    pthread_mutex_lock(&stw_call_m);
+    stw_call = false;
+    pthread_mutex_unlock(&stw_call_m);
 
     printf("end wait safepoint\n");
     printf("start stw logic\n");
 
     sleep(5);
+
+    list *all_roots = new_list();
+
+    for(int i = 0; i < 5; i++) {
+        add_all(all_roots, mutators[i].roots);
+    }
 
     printf("end stw logic\n");
 
@@ -121,4 +308,7 @@ void stw() {
     pthread_mutex_unlock(&stw_end_m);
 
     printf("exit stw\n");
+
+    pthread_t gc_background;
+    pthread_create(&gc_background, NULL, &tc_mark_sweep, all_roots);
 }
