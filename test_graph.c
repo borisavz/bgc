@@ -7,6 +7,8 @@ typedef struct list_node_t list_node;
 typedef struct list_t list;
 
 struct object_t {
+    bool marked;
+    int id;
     list *refs;
 };
 
@@ -21,6 +23,8 @@ struct list_t {
     list_node *last;
     int size;
 };
+
+list *all_objects;
 
 void add_first(list *list, void *element) {
     list_node *node = malloc(sizeof(list_node));
@@ -56,6 +60,18 @@ void add_last(list *list, void *element) {
     list->size++;
 }
 
+void add_all(list *target, list *source) {
+    if(source->size == 0) {
+        return;
+    }
+
+    list_node *curr_node = source->first;
+
+    do {
+        add_last(target, curr_node->element);
+    } while((curr_node = curr_node->next) != NULL);
+}
+
 void remove_last(list *list) {
     if(list->size == 0) {
         return;
@@ -86,18 +102,63 @@ list *new_list() {
     return new_list;
 }
 
+object *new_object() {
+    static int id = 0;
+
+    object *new_object = malloc(sizeof(object));
+
+    new_object->marked = false;
+    new_object->id = id;
+    new_object->refs = new_list();
+
+    id++;
+    add_last(all_objects, new_object);
+
+    return new_object;
+}
+
+void tc_mark_sweep(list *roots) {
+    list *worklist = new_list();
+
+    add_all(worklist, roots);
+
+    while(worklist->size != 0) {
+        object *obj = (object *) worklist->last->element;
+        remove_last(worklist);
+
+        if(obj->marked == false) {
+            obj->marked = true;
+            add_all(worklist, obj->refs);
+        }
+    }
+
+    list_node *curr_node = all_objects->first;
+
+    do {
+        object *obj = (object *) curr_node->element;
+        
+        if(obj->marked == false) {
+            printf("delete object %d\n", obj->id);
+        }
+    } while((curr_node = curr_node->next) != NULL);
+}
+
 int main() {
-    list *a = new_list();
+    all_objects = new_list();
 
-    for(int i = 0; i < 5; i++) {
-        int *x = malloc(sizeof(int));
-        *x = i;
-        add_last(a, x);
-    }
+    list *roots = new_list();
 
-    for(int i = 0; i < 5; i++) {
-        int x = *((int *) a->last->element);
-        printf("a[%d] = %d\n", i, x);
-        remove_last(a);
-    }
+    object *a = new_object();
+    object *b = new_object();
+    object *c = new_object();
+    object *d = new_object();
+
+    add_first(a->refs, b);
+    add_first(a->refs, c);
+
+    add_first(roots, a);
+
+    tc_mark_sweep(roots);
+
+    return 0;
 }
