@@ -20,6 +20,9 @@ typedef struct mutator_info_t mutator_info;
 bool stw_call = false;
 pthread_mutex_t stw_call_m = PTHREAD_MUTEX_INITIALIZER;
 
+bool gc_active = false;
+pthread_mutex_t gc_active_m = PTHREAD_MUTEX_INITIALIZER;
+
 struct mutator_info_t {
     list *roots;
 };
@@ -50,6 +53,9 @@ struct list_t {
 
 list *all_objects;
 pthread_mutex_t all_objects_m = PTHREAD_MUTEX_INITIALIZER;
+
+list *worklist;
+pthread_mutex_t worklist_m = PTHREAD_MUTEX_INITIALIZER;
 
 void add_first(list *list, void *element) {
     list_node *node = malloc(sizeof(list_node));
@@ -138,8 +144,6 @@ object *new_object() {
 
     id++;
 
-
-
     pthread_mutex_lock(&all_objects_m);
     add_last(all_objects, new_object);
     pthread_mutex_unlock(&all_objects_m);
@@ -147,8 +151,22 @@ object *new_object() {
     return new_object;
 }
 
-list *worklist;
-pthread_mutex_t worklist_m = PTHREAD_MUTEX_INITIALIZER;
+void add_ref(object *target, object *obj) {
+    add_last(target->refs, obj);
+
+    pthread_mutex_lock(&gc_active_m);
+
+    if(gc_active == true) {
+        printf("write barrier\n");
+        obj->marked = true;
+
+        pthread_mutex_lock(&worklist_m);
+        add_last(worklist, obj);
+        pthread_mutex_unlock(&worklist_m);
+    }
+    
+    pthread_mutex_unlock(&gc_active_m);
+}
 
 void tc_mark_sweep(list *roots) {
     worklist = new_list();
@@ -182,7 +200,13 @@ void tc_mark_sweep(list *roots) {
         if(obj->marked == false) {
             printf("delete object %d\n", obj->id);
         }
+
+        obj->marked = false;
     } while((curr_node = curr_node->next) != NULL);
+
+    pthread_mutex_lock(&gc_active_m);
+    gc_active = false;
+    pthread_mutex_unlock(&gc_active_m);
 }
 
 int main() {
@@ -192,7 +216,7 @@ int main() {
     
     for(int i = 0; i < 5; i++) {
         mutators[i].roots = new_list();
-        
+
         pthread_create(&threads[i], NULL, &mutator_thread, &mutators[i]);
     }
 
@@ -200,9 +224,9 @@ int main() {
 
     stw();
 
-    /*sleep(4);
+    sleep(4);
 
-    stw();*/
+    stw();
 
     for(int i = 0; i < 5; i++) {
         pthread_join(threads[i], NULL);
@@ -219,17 +243,26 @@ void mutator_thread(mutator_info *info) {
     object *c = new_object();
     object *d = new_object();
 
-    add_first(a->refs, b);
-    add_first(a->refs, c);
+    add_ref(a, b);
+    add_ref(a, c);
 
     add_first(info->roots, a);
 
     printf("enter mutator %ld\n", self_thread);
-    printf("start mutator logic %ld\n", self_thread);
+    
+    printf("start mutator logic 1 %ld\n", self_thread);
     sleep(10);
-    printf("end mutator logic %ld\n", self_thread);
+    printf("end mutator logic 1 %ld\n", self_thread);
+    
     safepoint(info, true);
+    
+    printf("start mutator logic 2 %ld\n", self_thread);
     sleep(5);
+    object *e = new_object();
+    object *f = new_object();
+    add_ref(a, e);
+    printf("end mutator logic 2 %ld\n", self_thread);
+    
     safepoint(info, false);
     printf("exit mutator %ld\n", self_thread);
 }
@@ -276,6 +309,10 @@ void stw() {
     stw_call = true;
     pthread_mutex_unlock(&stw_call_m);
 
+    pthread_mutex_lock(&gc_active_m);
+    gc_active = true;
+    pthread_mutex_unlock(&gc_active_m);
+
     printf("end stw call\n");
     printf("begin wait safepoint\n");
     
@@ -311,4 +348,5 @@ void stw() {
 
     pthread_t gc_background;
     pthread_create(&gc_background, NULL, &tc_mark_sweep, all_roots);
+    pthread_join(gc_background, NULL);
 }
